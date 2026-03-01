@@ -1,13 +1,38 @@
-import { NextResponse } from "next/server";
-import { MONTHLY_CHURN_DATA } from "@/lib/demo-data";
+import { NextRequest } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { getTenantId, unauthorizedResponse } from "@/lib/auth";
 
-// GET /api/churn - 退会率データ取得
-// TODO: Implement real churn prediction algorithm
-// Key signals to track:
-//   - Visit frequency decline (week-over-week)
-//   - Day-of-week pattern changes
-//   - Session duration reduction
-//   - Membership tenure (first 3 months = highest risk)
-export async function GET() {
-  return NextResponse.json({ churnData: MONTHLY_CHURN_DATA });
+/**
+ * GET /api/churn
+ * 月次解約統計を取得
+ *
+ * Query params:
+ *   - months: number (デフォルト: 6)
+ */
+export async function GET(request: NextRequest) {
+  const tenantId = await getTenantId(request);
+  if (!tenantId) return unauthorizedResponse();
+
+  const months = parseInt(
+    request.nextUrl.searchParams.get("months") ?? "6"
+  );
+
+  const stats = await prisma.monthlyStat.findMany({
+    where: { tenantId },
+    orderBy: { month: "desc" },
+    take: months,
+  });
+
+  const result = stats
+    .map((s) => ({
+      month: s.month.toISOString().slice(0, 7), // "2026-03"
+      totalMembers: s.totalMembers,
+      newMembers: s.newMembers,
+      churnedMembers: s.churnedMembers,
+      churnRate: s.churnRate,
+      totalVisits: s.totalVisits,
+    }))
+    .reverse(); // 古い順に並べ替え
+
+  return Response.json(result);
 }

@@ -1,0 +1,276 @@
+// =============================================================
+// ChurnGuard - Prisma Schema (Multi-tenant)
+// DB: Supabase (PostgreSQL)
+// 設計方針: 全テーブルに tenantId を持たせ、アプリ層で分離
+// =============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// =============================================================
+// 1. テナント (ジム)
+// =============================================================
+model Tenant {
+  id        String   @id @default(cuid())
+  name      String   // ジム名 (例: "A-1 EXPRESS")
+  branch    String   // 店舗名 (例: "つつじヶ丘店")
+  features  String[] // 特徴 (例: ["24H営業", "セルフ型"])
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // LINE連携情報
+  lineAccountName      String? @map("line_account_name")
+  lineChannelAccessToken String? @map("line_channel_access_token")
+  lineChannelSecret    String? @map("line_channel_secret")
+
+  // Relations
+  plans            Plan[]
+  members          Member[]
+  visits           Visit[]
+  riskSnapshots    RiskSnapshot[]
+  retentionRules   RetentionRule[]
+  actionLogs       ActionLog[]
+  monthlyStats     MonthlyStat[]
+  users            User[]
+  qrCodes          QrCode[]
+
+  @@map("tenants")
+}
+
+// =============================================================
+// 2. 料金プラン
+// GymConfigのplans配列を正規化。テナントごとに異なるプラン体系に対応
+// =============================================================
+model Plan {
+  id        String @id @default(cuid())
+  tenantId  String @map("tenant_id")
+  name      String // プラン名 (例: "単店会員", "レギュラー")
+  fee       Int    // 月額 (円)
+  isActive  Boolean @default(true) @map("is_active")
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  members   Member[]
+
+  @@index([tenantId])
+  @@map("plans")
+}
+
+// =============================================================
+// 3. 会員
+// 既存のMember型を拡張。riskScore等の計算値はRiskSnapshotに分離
+// =============================================================
+model Member {
+  id        String   @id @default(cuid())
+  tenantId  String   @map("tenant_id")
+  planId    String?  @map("plan_id")
+  name      String
+  email     String?
+  age       Int?
+  joinDate  DateTime @map("join_date")
+  avatarUrl String?  @map("avatar_url")
+  status    MemberStatus @default(ACTIVE)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  plan          Plan?          @relation(fields: [planId], references: [id], onDelete: SetNull)
+  visits        Visit[]
+  riskSnapshots RiskSnapshot[]
+  actionLogs    ActionLog[]
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("members")
+}
+
+enum MemberStatus {
+  ACTIVE    // 在籍中
+  CHURNED   // 退会済み
+  SUSPENDED // 休会中
+}
+
+// =============================================================
+// 4. 来館記録
+// QRコード読み取りで1レコード生成。集計はクエリで算出
+// =============================================================
+model Visit {
+  id        String   @id @default(cuid())
+  tenantId  String   @map("tenant_id")
+  memberId  String   @map("member_id")
+  visitedAt DateTime @default(now()) @map("visited_at")
+  method    VisitMethod @default(QR_CODE)
+
+  tenant    Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  member    Member @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([memberId, visitedAt])
+  @@index([tenantId, visitedAt]) // 店舗ごとの来館数集計用
+  @@map("visits")
+}
+
+enum VisitMethod {
+  QR_CODE   // QRコードスキャン
+  MANUAL    // 手動入力 (管理者)
+  IC_CARD   // ICカード (将来拡張)
+  API_SYNC  // 外部システムAPI連携 (将来拡張)
+}
+
+// =============================================================
+// 5. リスクスコア履歴
+// ルールベースで日次 or 週次バッチ計算 → スナップショット保存
+// 最新スコアは "WHERE memberId = X ORDER BY calculatedAt DESC LIMIT 1"
+// =============================================================
+model RiskSnapshot {
+  id           String   @id @default(cuid())
+  tenantId     String   @map("tenant_id")
+  memberId     String   @map("member_id")
+  riskScore    Int      @map("risk_score")    // 0-100
+  trend        Trend    @default(STABLE)
+  factors      Json?    // 計算根拠 (例: {"visitsThisMonth": 2, "avgVisits": 8, "daysSinceLastVisit": 12})
+  calculatedAt DateTime @default(now()) @map("calculated_at")
+
+  tenant       Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  member       Member @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([memberId, calculatedAt])
+  @@map("risk_snapshots")
+}
+
+enum Trend {
+  UP      // リスク上昇
+  DOWN    // リスク低下
+  STABLE  // 変化なし
+}
+
+// =============================================================
+// 6. リテンション施策ルール
+// ダッシュボードの「自動施策ルール」をDB化
+// =============================================================
+model RetentionRule {
+  id               String  @id @default(cuid())
+  tenantId         String  @map("tenant_id")
+  name             String  // 施策名 (例: "休眠会員フォロー")
+  description      String?
+  triggerCondition Json    @map("trigger_condition")
+  // 例: {"type": "risk_threshold", "minScore": 70, "daysSinceLastVisit": 14}
+  messageTemplate  String  @map("message_template")
+  channel          ActionChannel @default(LINE)
+  isActive         Boolean @default(true) @map("is_active")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  tenant           Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  actionLogs       ActionLog[]
+
+  @@index([tenantId])
+  @@map("retention_rules")
+}
+
+// =============================================================
+// 7. 施策実行ログ
+// どの会員にいつ何を送ったかの記録
+// =============================================================
+model ActionLog {
+  id         String        @id @default(cuid())
+  tenantId   String        @map("tenant_id")
+  memberId   String        @map("member_id")
+  ruleId     String?       @map("rule_id")
+  channel    ActionChannel @default(LINE)
+  status     ActionStatus  @default(PENDING)
+  messageSent String?      @map("message_sent")
+  executedAt DateTime      @default(now()) @map("executed_at")
+  error      String?       // 送信失敗時のエラー内容
+
+  tenant     Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  member     Member         @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  rule       RetentionRule? @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId])
+  @@index([memberId, executedAt])
+  @@map("action_logs")
+}
+
+enum ActionChannel {
+  LINE
+  EMAIL
+  SMS
+}
+
+enum ActionStatus {
+  PENDING   // 送信待ち
+  SENT      // 送信済み
+  DELIVERED // 到達確認
+  FAILED    // 送信失敗
+}
+
+// =============================================================
+// 8. 月次統計
+// 解約トレンドグラフ用。月末バッチで集計
+// =============================================================
+model MonthlyStat {
+  id            String   @id @default(cuid())
+  tenantId      String   @map("tenant_id")
+  month         DateTime // 月初日 (例: 2026-03-01)
+  totalMembers  Int      @map("total_members")
+  newMembers    Int      @default(0) @map("new_members")
+  churnedMembers Int     @map("churned_members")
+  churnRate     Float    @map("churn_rate") // 0.0 - 1.0
+  totalVisits   Int      @default(0) @map("total_visits")
+
+  tenant        Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, month])
+  @@index([tenantId])
+  @@map("monthly_stats")
+}
+
+// =============================================================
+// 9. 管理ユーザー
+// NextAuth.js との連携を想定。tenantId でジムに紐付け
+// =============================================================
+model User {
+  id        String   @id @default(cuid())
+  tenantId  String   @map("tenant_id")
+  email     String   @unique
+  name      String?
+  role      UserRole @default(STAFF)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("users")
+}
+
+enum UserRole {
+  OWNER   // ジムオーナー (全権限)
+  MANAGER // 店長 (設定変更可)
+  STAFF   // スタッフ (閲覧のみ)
+}
+
+// =============================================================
+// 10. QRコード
+// 会員ごとのユニークQRコード管理
+// =============================================================
+model QrCode {
+  id        String   @id @default(cuid())
+  tenantId  String   @map("tenant_id")
+  memberId  String   @unique @map("member_id") // 会員1人に1つ
+  code      String   @unique // QRコードの値 (UUID等)
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant    Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([code]) // QRスキャン時の高速検索
+  @@map("qr_codes")
+}

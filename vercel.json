@@ -1,0 +1,20 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/risk-calculate",
+      "schedule": "0 3 * * *"
+    },
+    {
+      "path": "/api/cron/monthly-stats",
+      "schedule": "0 0 1 * *"
+    },
+    {
+      "path": "/api/cron/retention-check",
+      "schedule": "0 9 * * *"
+    },
+    {
+      "path": "/api/cron/keepalive",
+      "schedule": "0 0 */3 * *"
+    }
+  ]
+}
